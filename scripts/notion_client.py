@@ -183,8 +183,7 @@ def get_backlog_tasks():
                 {"property": "상태", "status": {"equals": "Todo"}},
                 {"property": "상태", "status": {"equals": "Open"}},
                 {"property": "상태", "status": {"equals": "In progress"}},
-                {"property": "상태", "status": {"equals": "시작 전"}},
-                {"property": "상태", "status": {"equals": "진행 중"}},
+                {"property": "상태", "status": {"equals": "Holding"}},
             ]
         }
     }, config)
@@ -216,7 +215,10 @@ def add_task_to_todo(name, props=None):
         if props.get("issue_type"):
             properties["이슈 유형"] = {"select": {"name": props["issue_type"]}}
         if props.get("category"):
-            properties["분류"] = {"select": {"name": props["category"]}}
+            if isinstance(props["category"], list):
+                properties["분류"] = {"multi_select": [{"name": c} for c in props["category"]]}
+            else:
+                properties["분류"] = {"multi_select": [{"name": props["category"]}]}
         if props.get("do_today"):
             properties["Do Today"] = {"checkbox": True}
     result = _notion_post("/pages", {
@@ -440,7 +442,8 @@ def update_timebox_checkin(page_id, checkin_note):
 
     if checkin_heading_id:
         now = datetime.now().strftime("%H:%M")
-        _notion_patch(f"/blocks/{checkin_heading_id}/children", {
+        # heading 뒤에 블록 삽입 (after 파라미터 사용)
+        _notion_patch(f"/blocks/{page_id}/children", {
             "children": [{
                 "object": "block", "type": "callout", "callout": {
                     "icon": {"type": "emoji", "emoji": "📌"},
@@ -448,7 +451,8 @@ def update_timebox_checkin(page_id, checkin_note):
                         "content": f"{now} — {checkin_note}"
                     }}],
                 }
-            }]
+            }],
+            "after": checkin_heading_id,
         }, config)
 
     # 상태를 진행중으로 변경
@@ -529,7 +533,7 @@ def finalize_timebox(page_id, user_review="", date_str=None):
     completed_blocks = sum(min(t["actual"], t["assigned"]) for t in task_results)
     achievement = round(completed_blocks / total_assigned_blocks, 2) if total_assigned_blocks else 0
 
-    # 타임박싱 페이지 속성 업데이트
+    # 타임박싱 페이지 속성 업데이트 (상태는 select 타입)
     _notion_patch(f"/pages/{page_id}", {
         "properties": {
             "총 블록": {"number": total_assigned_blocks},
@@ -579,8 +583,10 @@ def finalize_timebox(page_id, user_review="", date_str=None):
         review_children.append(_make_paragraph(f"━━ 한줄 회고 ━━"))
         review_children.append(_make_paragraph(user_review if user_review else "(작성 필요)"))
 
-        _notion_patch(f"/blocks/{review_heading_id}/children", {
-            "children": review_children
+        # heading 블록은 children을 지원하지 않으므로, 페이지에 after로 추가
+        _notion_patch(f"/blocks/{page_id}/children", {
+            "children": review_children,
+            "after": review_heading_id,
         }, config)
 
     print(f"Finalized: {completed_blocks}/{total_assigned_blocks} ({achievement * 100:.0f}%)")
@@ -784,7 +790,11 @@ def _calc_blocks_from_date_range(date_prop):
 
 
 def _calc_blocks_from_checkin_out(checkin_prop, checkout_prop):
-    """check-in/check-out date 속성에서 실제 실행 블록 수 계산."""
+    """check-in/check-out date 속성에서 실제 실행 블록 수 계산.
+
+    Notion에서 check-in/check-out 시각의 타임존이 혼재될 수 있으므로
+    (+09:00 vs +00:00) 타임존을 무시하고 로컬 시각(naive) 기준으로 계산한다.
+    """
     if not checkin_prop or not checkout_prop:
         return 0
     checkin_date = checkin_prop.get("date")
@@ -796,9 +806,11 @@ def _calc_blocks_from_checkin_out(checkin_prop, checkout_prop):
     if not start_str or not end_str:
         return 0
     try:
-        start = datetime.fromisoformat(start_str)
-        end = datetime.fromisoformat(end_str)
+        start = datetime.fromisoformat(start_str).replace(tzinfo=None)
+        end = datetime.fromisoformat(end_str).replace(tzinfo=None)
         minutes = (end - start).total_seconds() // 60
+        if minutes < 0:
+            return 0
         return int(minutes // 15)
     except (ValueError, AttributeError):
         return 0
@@ -852,6 +864,8 @@ def main():
 
     if cmd == "test":
         test_connection()
+    elif cmd == "cleanup":
+        cleanup_previous_day()
     elif cmd == "setup":
         setup_databases()
     elif cmd == "today-tasks":
